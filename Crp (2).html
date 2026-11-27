@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Virtual Workshop Simulator</title>
+<style>
+:root{--bg:#1b2025;--pn:#262d34;--ln:#3b4550;--tx:#e8edf1;--ac:#f2b233}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:14px system-ui,sans-serif;overflow:hidden}
+#app{display:flex;flex-direction:column;height:100%}
+.bar{display:flex;gap:4px;padding:4px;background:var(--pn);overflow-x:auto;flex-shrink:0;align-items:center}
+button,select{background:#37414c;color:var(--tx);border:1px solid var(--ln);border-radius:5px;padding:7px 9px;font-size:13px;white-space:nowrap;cursor:pointer}
+button:hover{background:#465260}
+button.on{background:var(--ac);color:#111;border-color:var(--ac);font-weight:600}
+#main{flex:1;position:relative;min-height:0}
+canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none}
+#info{position:absolute;left:6px;top:6px;background:#000b;padding:5px 8px;border-radius:5px;font-size:12px;pointer-events:none;max-width:72%;line-height:1.4}
+#show{position:absolute;left:0;right:0;bottom:0;max-height:42%;overflow:auto;background:#1b2025ee;padding:8px 10px;display:none;border-top:2px solid var(--ac);font-size:13px;line-height:1.5}
+#toast{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);background:#000d;padding:7px 12px;border-radius:6px;display:none;max-width:90%;border:1px solid var(--ac);z-index:20}
+#side{position:absolute;right:0;top:0;bottom:0;width:min(340px,90vw);background:var(--pn);overflow:auto;padding:8px;transform:translateX(100%);transition:transform .2s;border-left:1px solid var(--ln);z-index:10}
+#side.open{transform:none}
+#side h3{margin:10px 0 4px;font-size:14px;color:var(--ac)}
+#side p,#side li{font-size:13px;line-height:1.4;margin:3px 0}
+#side ul{padding-left:18px;margin:4px 0}
+.mat{display:flex;gap:6px;width:100%;margin:3px 0;align-items:center}
+.sw{width:18px;height:18px;border-radius:3px;border:1px solid #0006;flex-shrink:0}
+.pg{height:8px;background:#0006;border-radius:4px;overflow:hidden;margin-bottom:6px}.pg i{display:block;height:100%;background:var(--ac);transition:width .3s}
+.ok{color:#7fd77f}
+</style></head><body>
+<div id="app">
+<div class="bar">
+<button id="bPanel">Panel</button><button id="bUndo">Undo</button><button id="bRedo">Redo</button>
+<button id="bZi">Zoom +</button><button id="bZo">Zoom −</button><button id="bFit">Reset view</button>
+<button id="b3d">3D view</button><button id="bShow">Show piece</button><button id="bRef">End result</button>
+<button id="bSave">Save</button><button id="bLoad">Load</button><button id="bReset">Clear bench</button>
+</div>
+<div id="main"><canvas id="cv"></canvas><div id="info"></div><div id="toast"></div><div id="show"></div>
+<div id="side"></div></div>
+<div class="bar" id="tools"></div>
+<div class="bar" id="acts"></div>
+</div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id),cv=$('cv'),cx=cv.getContext('2d');
+const MAT={
+  bar:{n:'Flat bar 100×20×5 mm',w:100,h:20,th:5,c:'#9aa5b1'},
+  plate:{n:'Plate 100×60×6 mm',w:100,h:60,th:6,c:'#7b8794'},
+  sheet:{n:'Sheet metal 120×80×1.5 mm',w:120,h:80,th:1.5,c:'#bcc7d2'},
+  wood:{n:'Wood block 100×40×20 mm',w:100,h:40,th:20,c:'#b98a52'},
+  plank:{n:'Pine plank 150×45×18 mm',w:150,h:45,th:18,c:'#d2ae72'}
+};
+const TOOLS=[
+  ['select','Move'],['rule','Steel rule'],['scr','Scriber'],['pun','Centre punch'],
+  ['cut','Line Cut'],['shapeCut','Shape Cut'],['bend','Bend'],['file','File'],['drl','Drill 8 mm'],['deb','Deburr'],['join','Join']
+];
+const HINT={
+  select:'Drag a piece to move it, drag the bench to pan, scroll/pinch to zoom.',
+  rule:'Drag or tap two points to measure distance in mm.',
+  scr:'Drag across a piece to scribe a marking line.',
+  pun:'Tap a piece to centre punch a mark.',
+  cut:'Drag one straight cutting line completely across the piece, then confirm to separate it into two pieces.',
+  shapeCut:'First tap inside the piece, then tap points around the area to remove. The outline must cross an outer edge twice.',
+  bend:'Set angle, drag a bend line across sheet metal, then press Confirm bend.',
+  file:'Tap near an edge to file it (Rough = 1 mm, Smooth = 0.25 mm).',
+  drl:'Tap inside a piece to drill an 8 mm hole.',
+  deb:'Tap a piece to deburr its sharp edges.',
+  join:'Tap two touching pieces to join them together.'
+};
+
+let S={p:[],l:[],id:1,st:{measure:0,mark:0,punch:0,cut:0,bend:0,file:0,smooth:0,drill:0,deburr:0,join:0,clamp:0},proj:0};
+let sel=null,tool='select',V={x:40,y:120,s:3},hist=[],redo=[],tmp=null,cutLine=null,cutRect=null,shapeCutPts=[],shapeCutPid=null,rough=true,bendAng=90;
+let drag=null,down=null,ptrs={},pinch=null,note='',v3=false,showMode=false,refMode=false,sparks=[];
+let K={cx:0,cy:0,s:3,yaw:0.6,pitch:0.85},SH={y:0};
+
+const rad=a=>a*Math.PI/180;
+const rot=(x,y,a)=>{const c=Math.cos(rad(a)),s=Math.sin(rad(a));return[x*c-y*s,x*s+y*c]};
+const toW=(p,x,y)=>{const r=rot(x,y,p.a);return[r[0]+p.x,r[1]+p.y]};
+const toL=(p,x,y)=>rot(x-p.x,y-p.y,-p.a);
+const s2w=(x,y)=>[(x-V.x)/V.s,(y-V.y)/V.s];
+const cur=()=>S.p.find(p=>p.id===sel);
+const TH=p=>p.th||(MAT[p.m]?MAT[p.m].th:5);
+
+function inPoly(pt,po){
+  let c=false;
+  for(let i=0,j=po.length-1;i<po.length;j=i++){
+    const a=po[i],b=po[j];
+    if((a[1]>pt[1])!=(b[1]>pt[1])&&pt[0]<(b[0]-a[0])*(pt[1]-a[1])/(b[1]-a[1])+a[0])c=!c;
+  }
+  return c;
+}
+function clip(po,n,d){
+  const o=[];
+  for(let i=0;i<po.length;i++){
+    const a=po[i],b=po[(i+1)%po.length],da=n[0]*a[0]+n[1]*a[1]-d,db=n[0]*b[0]+n[1]*b[1]-d;
+    if(da<=0)o.push(a);
+    if(da*db<0){const t=da/(da-db);o.push([a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t])}
+  }
+  return o.filter((q,i)=>{const z=o[(i+o.length-1)%o.length];return Math.hypot(q[0]-z[0],q[1]-z[1])>1e-6});
+}
+function area(po){
+  let s=0;
+  for(let i=0;i<po.length;i++){const a=po[i],b=po[(i+1)%po.length];s+=a[0]*b[1]-b[0]*a[1]}
+  return Math.abs(s)/2;
+}
+function dseg(p,a,b){
+  const dx=b[0]-a[0],dy=b[1]-a[1];
+  let t=((p[0]-a[0])*dx+(p[1]-a[1])*dy)/(dx*dx+dy*dy||1);
+  t=Math.max(0,Math.min(1,t));
+  return Math.hypot(p[0]-a[0]-t*dx,p[1]-a[1]-t*dy);
+}
+const bb=p=>{let a=1e9,b=1e9,c=-1e9,d=-1e9;p.poly.forEach(q=>{a=Math.min(a,q[0]);b=Math.min(b,q[1]);c=Math.max(c,q[0]);d=Math.max(d,q[1])});return[a,b,c,d]};
+const dims=p=>{const q=bb(p);return[q[2]-q[0],q[3]-q[1]]};
+const wb=p=>{let a=1e9,b=1e9,c=-1e9,d=-1e9;p.poly.forEach(q=>{const w=toW(p,q[0],q[1]);a=Math.min(a,w[0]);b=Math.min(b,w[1]);c=Math.max(c,w[0]);d=Math.max(d,w[1])});return[a,b,c,d]};
+const pick=w=>{for(let i=S.p.length-1;i>=0;i--){const p=S.p[i];if(inPoly(toL(p,w[0],w[1]),p.poly))return p}return null};
+
+function toast(t){const e=$('toast');e.textContent=t;e.style.display='block';clearTimeout(toast.t);toast.t=setTimeout(()=>e.style.display='none',2400)}
+function snap(){hist.push(JSON.stringify(S));if(hist.length>60)hist.shift();redo=[]}
+function undo(){if(!hist.length)return;redo.push(JSON.stringify(S));S=JSON.parse(hist.pop());sel=null;cutLine=null;cutRect=null;shapeCutPts=[];shapeCutPid=null;ui()}
+function redoF(){if(!redo.length)return;hist.push(JSON.stringify(S));S=JSON.parse(redo.pop());sel=null;ui()}
+function group(id){
+  const g=[id];
+  for(let i=0;i<g.length;i++)S.l.forEach(l=>{
+    if(l[0]==g[i]&&!g.includes(l[1]))g.push(l[1]);
+    if(l[1]==g[i]&&!g.includes(l[0]))g.push(l[0]);
+  });
+  return S.p.filter(p=>g.includes(p.id));
+}
+function spawnSparks(wx,wy,col='#ffd166'){
+  for(let i=0;i<10;i++){
+    const a=Math.random()*Math.PI*2,sp=15+Math.random()*35;
+    sparks.push({x:wx,y:wy,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:1,c:col});
+  }
+}
+
+function addPiece(k){
+  snap();
+  const m=MAT[k],w=v3?[K.cx,K.cy]:s2w(cv.clientWidth/2,cv.clientHeight/2),j=S.p.length*6%40;
+  S.p.push({id:S.id++,m:k,x:w[0]+j-20,y:w[1]+j-20,a:0,poly:[[-m.w/2,-m.h/2],[m.w/2,-m.h/2],[m.w/2,m.h/2],[-m.w/2,m.h/2]],holes:[],marks:[],cl:false,fin:0,th:m.th,bends:[]});
+  sel=S.p[S.p.length-1].id;
+  ui();
+}
+
+function addCustomPart(name,w,h,th,x,y,holes=[],material='bar',poly=null){
+  const part={id:S.id++,m:material,part:name,x,y,a:0,poly:poly||[[-w/2,-h/2],[w/2,-h/2],[w/2,h/2],[-w/2,h/2]],holes:holes.map(q=>q.slice()),marks:[],cl:false,fin:0,th,bends:[]};
+  S.p.push(part);return part;
+}
+function addScissorKit(){
+  if(S.p.some(p=>p.part&&p.part.startsWith('Scissor lift:'))){toast('Scissor lift kit is already on the bench');return;}
+  snap();
+  const c=v3?[K.cx,K.cy]:s2w(cv.clientWidth/2,cv.clientHeight/2);
+  const x=c[0],y=c[1];
+  // Factory-prepared parts: four equal links with pivot holes, base, platform, slider blocks and pivot pins.
+  const armHoles=[[-34,0,3],[0,0,3],[34,0,3]];
+  const parts=[];
+  for(let i=0;i<4;i++)parts.push(addCustomPart(`Scissor lift: arm ${i+1}`,76,10,4,x-115+(i%2)*95,y-75+Math.floor(i/2)*30,armHoles));
+  parts.push(addCustomPart('Scissor lift: base frame',112,18,5,x+75,y-80,[],'plate'));
+  parts.push(addCustomPart('Scissor lift: top platform',112,18,5,x+75,y-45,[],'plate'));
+  parts.push(addCustomPart('Scissor lift: slider block A',18,14,6,x-80,y+5,[],'plate'));
+  parts.push(addCustomPart('Scissor lift: slider block B',18,14,6,x-48,y+5,[],'plate'));
+  parts.push(addCustomPart('Scissor lift: pivot pin set 1',22,5,5,x+20,y+25));
+  parts.push(addCustomPart('Scissor lift: pivot pin set 2',22,5,5,x+50,y+25));
+  parts.push(addCustomPart('Scissor lift: spring guide',38,6,4,x+85,y+25));
+  const coil=[[-18,-3],[-13,-8],[-8,8],[-3,-8],[2,8],[7,-8],[12,8],[17,-3],[18,3],[13,8],[8,-8],[3,8],[-2,-8],[-7,8],[-12,-8],[-17,3]];
+  parts.push(addCustomPart('Scissor lift: return spring',36,16,2,x+135,y+25,[],'bar',coil));
+  sel=parts[0].id;ui();toast('Pre-cut scissor lift kit placed on the bench');
+}
+
+function bentCheck(p){
+  if(p&&((p.bends&&p.bends.length)||p.bend)){
+    toast('This piece is already folded. Add more bends with the Bend tool; unbend it before cutting, filing, or drilling.');
+    return true;
+  }
+  return false;
+}
+
+function doBend(){
+  if(!cutLine)return;
+  const [A,B]=cutLine,mid=[(A[0]+B[0])/2,(A[1]+B[1])/2],c=cur();
+  const p=(c&&inPoly(toL(c,mid[0],mid[1]),c.poly))?c:(pick(mid)||pick(A)||pick(B)||c);
+  if(!p)return toast('Select a sheet metal piece to bend');
+  if(p.m!=='sheet')return toast('Only sheet metal can be bent');
+  if(p.bend&&!p.bends)p.bends=[p.bend];
+  if(!p.bends)p.bends=[];
+
+  const a=toL(p,A[0],A[1]),b=toL(p,B[0],B[1]);
+  const dx=b[0]-a[0],dy=b[1]-a[1],L=Math.hypot(dx,dy);
+  if(L<1)return toast('Draw a longer bend line');
+  let n=[dy/L,-dx/L],d=n[0]*a[0]+n[1]*a[1];
+  const P1=clip(p.poly,n,d),P2=clip(p.poly,[-n[0],-n[1]],-d);
+  if(P1.length<3||P2.length<3||area(P1)<2||area(P2)<2)return toast('The bend line must cross the sheet');
+
+  // Orient the normal so the smaller flange is always on its positive side.
+  if(area(P1)<area(P2)){n=[-n[0],-n[1]];d=-d;}
+
+  // Reject duplicate/overlapping creases, but allow independent bends elsewhere.
+  const near=(x,y)=>Math.min(dseg(x,y.a,y.b),dseg(y,y.a,y.b));
+  if(p.bends.some(old=>dseg(a,old.a,old.b)<2&&dseg(b,old.a,old.b)<2)){
+    return toast('A bend already exists at this position');
+  }
+  snap();
+  p.bends.push({n,d,ang:bendAng,a,b});
+  p.bend=null;
+  S.st.bend=(S.st.bend||0)+1;
+  if(!S.st.mark)note='Tip: scribe each bend line first for accuracy.';
+  sel=p.id;cutLine=null;
+  toast(`Bend ${p.bends.length} added at ${bendAng}°`);
+  ui();
+}
+
+function rectInside(pt,r){return pt[0]>=r.x1&&pt[0]<=r.x2&&pt[1]>=r.y1&&pt[1]<=r.y2}
+function edgeEntry(outside,inside,r){
+  let lo=0,hi=1;
+  for(let i=0;i<36;i++){
+    const t=(lo+hi)/2,q=[outside[0]+(inside[0]-outside[0])*t,outside[1]+(inside[1]-outside[1])*t];
+    if(rectInside(q,r))hi=t;else lo=t;
+  }
+  return [outside[0]+(inside[0]-outside[0])*hi,outside[1]+(inside[1]-outside[1])*hi];
+}
+function segHit(a,b,c,d){
+  const rx=b[0]-a[0],ry=b[1]-a[1],sx=d[0]-c[0],sy=d[1]-c[1];
+  const den=rx*sy-ry*sx;if(Math.abs(den)<1e-8)return null;
+  const qx=c[0]-a[0],qy=c[1]-a[1],t=(qx*sy-qy*sx)/den,u=(qx*ry-qy*rx)/den;
+  if(t<-1e-7||t>1+1e-7||u<-1e-7||u>1+1e-7)return null;
+  return {p:[a[0]+t*rx,a[1]+t*ry],t,u};
+}
+function pathForward(poly,A,B){
+  const out=[A.p.slice()];let i=A.i,guard=0;
+  while(guard++<=poly.length+1){
+    const next=(i+1)%poly.length;
+    if(i===B.i&&B.t>=A.t-1e-8){out.push(B.p.slice());return out;}
+    out.push(poly[next].slice());i=next;
+    if(i===B.i){out.push(B.p.slice());return out;}
+  }
+  return out;
+}
+function polygonNotch(piece,cut){
+  const hits=[];
+  for(let i=0;i<piece.length;i++)for(let j=0;j<cut.length;j++){
+    const h=segHit(piece[i],piece[(i+1)%piece.length],cut[j],cut[(j+1)%cut.length]);
+    if(h&&!hits.some(x=>Math.hypot(x.p[0]-h.p[0],x.p[1]-h.p[1])<1e-5))hits.push({p:h.p,i,t:h.t,j,u:h.u});
+  }
+  if(hits.length!==2)return {error:'The outline must cross the sheet edge at exactly two points. Draw an edge notch, not a fully internal shape.'};
+  const [A,B]=hits;
+  const cutAB=pathForward(cut,{p:A.p,i:A.j,t:A.u},{p:B.p,i:B.j,t:B.u});
+  const cutBA=pathForward(cut,{p:B.p,i:B.j,t:B.u},{p:A.p,i:A.j,t:A.u});
+  const insidePath=path=>{
+    for(let i=0;i<path.length-1;i++){
+      const m=[(path[i][0]+path[i+1][0])/2,(path[i][1]+path[i+1][1])/2];
+      if(!inPoly(m,piece)&&!piece.some((q,k)=>dseg(m,q,piece[(k+1)%piece.length])<1e-5))return false;
+    }
+    return true;
+  };
+  const cp=insidePath(cutAB)?cutAB:(insidePath(cutBA)?cutBA:null);
+  if(!cp)return {error:'The cut outline must follow a path inside the material between its two edge intersections.'};
+  const outerAB=pathForward(piece,{p:A.p,i:A.i,t:A.t},{p:B.p,i:B.i,t:B.t});
+  const outerBA=pathForward(piece,{p:B.p,i:B.i,t:B.t},{p:A.p,i:A.i,t:A.t});
+  const candidates=[outerAB.concat(cp.slice(0,-1).reverse()),outerBA.concat(cp.slice(0,-1).reverse())]
+    .map(po=>po.filter((q,i)=>i===0||Math.hypot(q[0]-po[i-1][0],q[1]-po[i-1][1])>1e-6))
+    .filter(po=>po.length>=3&&area(po)>1&&area(po)<area(piece)-1);
+  if(!candidates.length)return {error:'That outline does not leave a valid piece. Adjust the points and try again.'};
+  candidates.sort((a,b)=>area(b)-area(a));
+  return {poly:candidates[0],removed:area(piece)-area(candidates[0])};
+}
+function doShapeCut(){
+  if(shapeCutPts.length<3)return toast('Add at least 3 points to outline the cut area');
+  const p=S.p.find(q=>q.id===shapeCutPid);if(!p)return toast('Tap a piece first to start the shape cut');
+  if(bentCheck(p))return;
+  const result=polygonNotch(p.poly,shapeCutPts);
+  if(result.error)return toast(result.error);
+  snap();p.poly=result.poly;
+  p.holes=p.holes.filter(h=>inPoly(h,p.poly));
+  p.marks=p.marks.filter(m=>m.t==='l'||inPoly(m.p,p.poly));
+  S.st.cut++;sel=p.id;shapeCutPts=[];shapeCutPid=null;
+  spawnSparks(p.x,p.y);note='Shape cut completed. Inspect the new edge and measure the remaining dimensions.';
+  toast(`Shape cut complete · approximately ${result.removed.toFixed(1)} mm² removed`);ui();
+}
+
+function doAreaCut(){
+  if(!cutRect)return;
+  const [[wx1,wy1],[wx2,wy2]]=cutRect;
+  const c=cur(),mid=[(wx1+wx2)/2,(wy1+wy2)/2];
+  const p=(c&&inPoly(toL(c,mid[0],mid[1]),c.poly))?c:(pick(mid)||c);
+  if(!p)return toast('Select a piece and drag over one of its corners');
+  if(bentCheck(p))return;
+  const corners=[[wx1,wy1],[wx2,wy1],[wx2,wy2],[wx1,wy2]].map(q=>toL(p,q[0],q[1]));
+  const xs=corners.map(q=>q[0]),ys=corners.map(q=>q[1]);
+  const r={x1:Math.min(...xs),x2:Math.max(...xs),y1:Math.min(...ys),y2:Math.max(...ys)};
+  const inside=p.poly.map((q,i)=>rectInside(q,r)?i:-1).filter(i=>i>=0);
+  if(inside.length!==1)return toast('For a corner cut, the rectangle must cover exactly one corner');
+  const i=inside[0],n=p.poly.length,prev=p.poly[(i-1+n)%n],v=p.poly[i],next=p.poly[(i+1)%n];
+  if(rectInside(prev,r)||rectInside(next,r))return toast('Make the selected cut smaller so it removes only the corner');
+  const entry1=edgeEntry(prev,v,r),entry2=edgeEntry(next,v,r);
+  // A valid corner notch must intersect both edges adjacent to the selected corner.
+  if(!rectInside(entry1,r)||!rectInside(entry2,r)||Math.hypot(entry1[0]-prev[0],entry1[1]-prev[1])<.01||Math.hypot(entry2[0]-next[0],entry2[1]-next[1])<.01)
+    return toast('Drag the rectangle across a corner, not completely inside the sheet');
+  const newPoly=[];
+  for(let k=0;k<n;k++){
+    if(k===i){newPoly.push(entry1,entry2)}else newPoly.push(p.poly[k]);
+  }
+  if(area(newPoly)<2)return toast('Selected cut is too large');
+  snap();p.poly=newPoly;
+  p.holes=p.holes.filter(h=>!rectInside(h,r));
+  p.marks=p.marks.filter(m=>m.t==='l'||!rectInside(m.p,r));
+  S.st.cut++;
+  spawnSparks(mid[0],mid[1]);
+  if(!S.st.mark)note='Procedure tip: scribe the cut dimensions before cutting.';
+  sel=p.id;cutRect=null;toast(`Area removed: ${Math.abs(r.x2-r.x1).toFixed(1)} × ${Math.abs(r.y2-r.y1).toFixed(1)} mm`);ui();
+}
+
+function doCut(){
+  if(!cutLine)return;
+  const[A,B]=cutLine,mid=[(A[0]+B[0])/2,(A[1]+B[1])/2],c=cur();
+  const p=(c&&inPoly(toL(c,mid[0],mid[1]),c.poly))?c:(pick(mid)||pick(A)||pick(B)||c);
+  if(!p)return toast('Select a piece to cut');
+  if(bentCheck(p))return;
+  const a=toL(p,A[0],A[1]),b=toL(p,B[0],B[1]),dx=b[0]-a[0],dy=b[1]-a[1],L=Math.hypot(dx,dy),n=[dy/L,-dx/L],d=n[0]*a[0]+n[1]*a[1];
+  const P1=clip(p.poly,n,d),P2=clip(p.poly,[-n[0],-n[1]],-d);
+  if(P1.length<3||P2.length<3||area(P1)<2||area(P2)<2)return toast('The cutting line must cross the piece');
+  if(p.holes.some(h=>Math.abs(n[0]*h[0]+n[1]*h[1]-d)<h[2]+.5))return toast('The cutting line passes through a hole');
+  snap();
+  const wn=rot(n[0],n[1],p.a);
+  const mk=(po,k)=>{
+    const q=JSON.parse(JSON.stringify(p));
+    q.id=S.id++;q.poly=po;q.x=p.x+wn[0]*2*k;q.y=p.y+wn[1]*2*k;q.cl=false;q.fin=0;q.bend=null;q.bends=[];
+    q.holes=q.holes.filter(h=>(n[0]*h[0]+n[1]*h[1]<d)==(k<0));
+    q.marks=q.marks.filter(m=>m.t=='l'||inPoly(m.p,po));
+    return q;
+  };
+  const A1=mk(P1,-1),A2=mk(P2,1);
+  S.p=S.p.filter(q=>q!=p).concat([A1,A2]);
+  S.l=S.l.filter(l=>l[0]!=p.id&&l[1]!=p.id);
+  S.st.cut++;
+  spawnSparks(mid[0],mid[1]);
+  if(!S.st.mark)note='Procedure tip: scribe a line before cutting.';
+  sel=A1.id;cutLine=null;toast('Cut complete: two separate pieces');ui();
+}
+
+function fileEdge(p,w){
+  if(bentCheck(p))return;
+  const l=toL(p,w[0],w[1]);let bi=-1,bd=1e9;
+  p.poly.forEach((a,i)=>{const d=dseg(l,a,p.poly[(i+1)%p.poly.length]);if(d<bd){bd=d;bi=i}});
+  if(bd>12/(v3?K.s:V.s))return toast('Tap closer to an edge');
+  const a=p.poly[bi],b=p.poly[(bi+1)%p.poly.length],dx=b[0]-a[0],dy=b[1]-a[1],L=Math.hypot(dx,dy),n=[dy/L,-dx/L],step=rough?1:.25;
+  const np=clip(p.poly,n,n[0]*a[0]+n[1]*a[1]-step);
+  if(np.length<3||area(np)<4)return toast('Too little material left');
+  if(p.holes.some(h=>np.some((a,i)=>dseg(h,a,np[(i+1)%np.length])<h[2]+.5)))return toast('Filing here would break into a hole');
+  snap();p.poly=np;p.fin=Math.max(p.fin,1);rough?S.st.file++:S.st.smooth++;
+  spawnSparks(w[0],w[1],'#cbd5e1');
+  ui();
+}
+
+function drill(p,w){
+  if(bentCheck(p))return;
+  const l=toL(p,w[0],w[1]),r=4;
+  if(!inPoly(l,p.poly))return;
+  if(p.poly.some((a,i)=>dseg(l,a,p.poly[(i+1)%p.poly.length])<r+1))return toast('Too close to an edge');
+  if(p.holes.some(h=>Math.hypot(h[0]-l[0],h[1]-l[1])<h[2]+r+1))return toast('Too close to another hole');
+  snap();p.holes.push([l[0],l[1],r]);S.st.drill++;
+  spawnSparks(w[0],w[1],'#93c5fd');
+  ui();
+}
+
+// 3D Projection Math
+function pj(x,y,z){
+  const dx=x-K.cx,dy=y-K.cy;
+  const c=Math.cos(K.yaw),s=Math.sin(K.yaw);
+  const rx=c*dx-s*dy,ry=s*dx+c*dy;
+  const sp=Math.sin(K.pitch),cp=Math.cos(K.pitch);
+  const sx=cv.clientWidth/2+rx*K.s;
+  const sy=cv.clientHeight/2-SH.y+(ry*sp-z*cp)*K.s;
+  return[sx,sy,ry*cp+z*sp];
+}
+function un3(sx,sy,z){
+  const u=(sx-cv.clientWidth/2)/K.s;
+  const yr=((sy-cv.clientHeight/2+SH.y)/K.s+z*Math.cos(K.pitch))/Math.sin(K.pitch);
+  const c=Math.cos(K.yaw),n=Math.sin(K.yaw);
+  return[K.cx+c*u+n*yr,K.cy-n*u+c*yr];
+}
+function hit(e){
+  if(!v3)return s2w(e.offsetX,e.offsetY);
+  let b=null;
+  S.p.forEach(p=>{
+    const w=un3(e.offsetX,e.offsetY,TH(p));
+    if(inPoly(toL(p,w[0],w[1]),p.poly)){
+      const d=pj(p.x,p.y,0)[2];
+      if(!b||d>b.d)b={w,d};
+    }
+  });
+  return b?b.w:un3(e.offsetX,e.offsetY,0);
+}
+
+// Helper to fold a local 2D point into 3D space if it lies on the bent flange
+function foldLocal3D(p,lx,ly,zBase,count){
+  const bends=p.bends||(p.bend?[p.bend]:[]);
+  const rotateAxis=(q,A,B,angle)=>{
+    let u=[B[0]-A[0],B[1]-A[1],B[2]-A[2]];
+    const L=Math.hypot(...u);if(L<1e-8)return q;
+    u=u.map(v=>v/L);
+    const v=[q[0]-A[0],q[1]-A[1],q[2]-A[2]],r=rad(angle),c=Math.cos(r),sn=Math.sin(r);
+    const dot=u[0]*v[0]+u[1]*v[1]+u[2]*v[2];
+    const cross=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]];
+    return [A[0]+v[0]*c+cross[0]*sn+u[0]*dot*(1-c),A[1]+v[1]*c+cross[1]*sn+u[1]*dot*(1-c),A[2]+v[2]*c+cross[2]*sn+u[2]*dot*(1-c)];
+  };
+  const transform=(x,y,z,limit)=>{
+    let q=[x,y,z];
+    for(let i=0;i<limit;i++){
+      const bd=bends[i];
+      if(bd.n[0]*x+bd.n[1]*y-bd.d<=1e-7)continue;
+      const A=transform(bd.a[0],bd.a[1],0,i),B=transform(bd.b[0],bd.b[1],0,i);
+      const dx=bd.b[0]-bd.a[0],dy=bd.b[1]-bd.a[1],L=Math.hypot(dx,dy)||1;
+      const cross=(dx/L)*bd.n[1]-(dy/L)*bd.n[0];
+      q=rotateAxis(q,A,B,bd.ang*(cross>=0?1:-1));
+    }
+    return q;
+  };
+  return transform(lx,ly,zBase,count===undefined?bends.length:count);
+}
+
+cv.onpointerdown=e=>{
+  cv.setPointerCapture(e.pointerId);ptrs[e.pointerId]=[e.offsetX,e.offsetY];
+  if(Object.keys(ptrs).length==2){
+    const k=Object.values(ptrs);
+    pinch={d:Math.hypot(k[0][0]-k[1][0],k[0][1]-k[1][1]),s:(v3?K:V).s};drag=null;return;
+  }
+  if(showMode||refMode){drag={m:'orbit',sx:e.offsetX,sy:e.offsetY,yaw:K.yaw,pitch:K.pitch};return}
+  let w=hit(e);const p=pick(w);
+  if(v3&&!p&&cur())w=un3(e.offsetX,e.offsetY,TH(cur()));
+  const zp=p?TH(p):(cur()?TH(cur()):0);down=w;
+
+  if(tool=='select'){
+    sel=p?p.id:null;
+    if(p&&S.p[S.p.length-1]!==p){S.p.splice(S.p.indexOf(p),1);S.p.push(p)}
+    drag=p?{m:'move',w,sn:false,z:zp}:(v3?{m:'orbit',sx:e.offsetX,sy:e.offsetY,yaw:K.yaw,pitch:K.pitch}:{m:'pan',sx:e.offsetX,sy:e.offsetY,vx:V.x,vy:V.y});
+  }
+  else if(tool=='rule'){
+    if(!tmp)tmp={a:w,b:w,z:zp};
+    else{tmp.b=w;S.st.measure++;note='Measured '+Math.hypot(tmp.b[0]-tmp.a[0],tmp.b[1]-tmp.a[1]).toFixed(1)+' mm';tmp={a:null}}
+    if(tmp.a===null){tmp=null;drag=null}else drag={m:'line',z:tmp.z};
+  }
+  else if(tool=='cut'){tmp={a:w,b:w,z:zp};drag={m:'line',z:zp}}
+  else if(tool==='shapeCut'){
+    if(v3){toast('Switch to 2D Top View for Shape Cut');return;}
+    if(!shapeCutPid){if(!p){toast('Tap inside the piece to begin the cut outline');return;}if(bentCheck(p))return;shapeCutPid=p.id;sel=p.id;}
+    const target=S.p.find(q=>q.id===shapeCutPid);if(!target)return;
+    shapeCutPts.push(toL(target,w[0],w[1]));toast(`Cut outline point ${shapeCutPts.length} added`);ui();return;
+  }
+  else if(tool=='scr'||tool=='bend'){tmp={a:w,b:w,z:zp};drag={m:'line',z:zp}}
+  else if(tool=='pun'){
+    if(p&&!bentCheck(p)){snap();const l=toL(p,w[0],w[1]);p.marks.push({t:'p',p:l});S.st.punch++;S.st.mark++;sel=p.id}
+  }
+  else if(tool=='file'){
+    let bp=null,bd=1e9;
+    S.p.forEach(q=>{
+      const l=toL(q,w[0],w[1]);
+      q.poly.forEach((a,i)=>{const d=dseg(l,a,q.poly[(i+1)%q.poly.length]);if(d<bd){bd=d;bp=q}});
+    });
+    if(bp&&bd<=12/(v3?K.s:V.s)){sel=bp.id;fileEdge(bp,w)}else toast('Tap on or just beside an edge');
+  }
+  else if(tool=='drl'){if(p){sel=p.id;drill(p,w)}}
+  else if(tool=='deb'){if(p){snap();p.fin=2;S.st.deburr++;sel=p.id;toast('Edges deburred')}}
+  else if(tool=='join'){
+    if(p){
+      if(!tmp||tmp.id===undefined){tmp={id:p.id};toast('Now tap the piece to join it to')}
+      else if(tmp.id!=p.id){
+        const A=S.p.find(q=>q.id==tmp.id),a=wb(A),b=wb(p);
+        if(a[0]>b[2]+6||b[0]>a[2]+6||a[1]>b[3]+6||b[1]>a[3]+6)toast('Pieces must touch to be joined');
+        else if(!S.l.some(l=>l.includes(A.id)&&l.includes(p.id))){snap();S.l.push([A.id,p.id]);S.st.join++;toast('Pieces joined')}
+        tmp=null;
+      }
+    }
+  }
+  ui();
+};
+
+cv.onpointermove=e=>{
+  if(ptrs[e.pointerId])ptrs[e.pointerId]=[e.offsetX,e.offsetY];
+  if(pinch&&Object.keys(ptrs).length==2){
+    const k=Object.values(ptrs),d=Math.hypot(k[0][0]-k[1][0],k[0][1]-k[1][1]);
+    zoomAt((k[0][0]+k[1][0])/2,(k[0][1]+k[1][1])/2,Math.max(.8,Math.min(14,pinch.s*d/pinch.d))/(v3?K:V).s);
+    return;
+  }
+  if(!drag)return;
+  const w=(v3&&drag.z!==undefined)?un3(e.offsetX,e.offsetY,drag.z):hit(e);
+  if(drag.m=='orbit'){K.yaw=drag.yaw+(e.offsetX-drag.sx)*.01;K.pitch=Math.max(.35,Math.min(1.5,drag.pitch+(e.offsetY-drag.sy)*.01))}
+  else if(drag.m=='pan'){V.x=drag.vx+e.offsetX-drag.sx;V.y=drag.vy+e.offsetY-drag.sy}
+  else if(drag.m=='move'){
+    const p=cur();if(!p)return;
+    if(p.cl){if(!drag.warn){drag.warn=1;toast('Release the vice first to move this piece')}return}
+    if(!drag.sn){snap();drag.sn=true}
+    const dx=w[0]-drag.w[0],dy=w[1]-drag.w[1];
+    group(p.id).forEach(q=>{q.x+=dx;q.y+=dy});drag.w=w;
+  }
+  else if(drag.m=='line'&&tmp)tmp.b=w;
+
+  draw();
+};
+
+cv.onpointerup=cv.onpointercancel=e=>{
+  delete ptrs[e.pointerId];if(Object.keys(ptrs).length<2)pinch=null;
+  if(drag&&(drag.m=='line'||drag.m=='rect')&&tmp&&tmp.b){
+    const a=tmp.a,b=tmp.b,L=Math.hypot(b[0]-a[0],b[1]-a[1]);
+    if(tool=='scr'){
+      const p=pick(a)||pick([(a[0]+b[0])/2,(a[1]+b[1])/2])||pick(b)||cur();
+      if(p&&L>1&&!bentCheck(p)){snap();p.marks.push({t:'l',p:[...toL(p,a[0],a[1]),...toL(p,b[0],b[1])]});S.st.mark++;sel=p.id}
+      tmp=null;
+    }
+    else if(tool=='cut'){if(L>2){cutLine=[a,b];cutLine.z=tmp.z}tmp=null}
+    else if(tool=='bend'){if(L>3){cutLine=[a,b];cutLine.z=tmp.z}tmp=null}
+    else if(tool=='rule'&&L>1){S.st.measure++;note='Measured '+L.toFixed(1)+' mm';tmp=null}
+  }
+  drag=null;ui();
+};
+
+function zoomAt(x,y,f){
+  if(v3){K.s=Math.max(.8,Math.min(14,K.s*f));draw();return}
+  const w=s2w(x,y);V.s=Math.max(.8,Math.min(14,V.s*f));V.x=x-w[0]*V.s;V.y=y-w[1]*V.s;draw();
+}
+cv.onwheel=e=>{e.preventDefault();zoomAt(e.offsetX,e.offsetY,e.deltaY<0?1.15:.87)};
+
+const CK={
+  m:['Measure a piece with the steel rule',()=>S.st.measure>0],
+  k:['Scribe marking lines',()=>S.st.mark-S.st.punch>0],
+  u:['Centre punch marked points',()=>S.st.punch>0],
+  v:['Clamp a piece in the vice',()=>S.st.clamp>0],
+  c:['Cut the material',()=>S.st.cut>0],
+  f:['Rough file an edge',()=>S.st.file>0],
+  s:['Smooth file an edge',()=>S.st.smooth>0],
+  d:['Drill a hole',()=>S.st.drill>0],
+  h:['Drill at least 4 holes',()=>S.p.reduce((n,p)=>n+p.holes.length,0)>=4],
+  b:['Deburr the pieces',()=>S.st.deburr>0],
+  g:['Bend the sheet metal',()=>S.st.bend>0],
+  j:['Join fitted pieces',()=>S.st.join>0],
+  c2:['Make at least two cuts',()=>S.st.cut>=2]
+};
+const HOW={
+  m:'Choose Steel rule and drag between two points along the stock. Always measure before you mark.',
+  k:'Choose Scriber and drag a line across the piece where you want to cut or bend.',
+  u:'Choose Centre punch and tap along the scribed line and at drill positions so marks stay visible.',
+  v:'Select the piece, then press Clamp in vice. A clamped piece cannot move while you work on it.',
+  c:'Choose Cut, drag a line along the scribed mark, then press Confirm cut.',
+  f:'Choose File with Rough selected and tap on or just beside an edge (removes 1 mm).',
+  s:'Switch to Smooth file and tap the edge (removes 0.25 mm for fine finishing).',
+  d:'Choose Drill and tap inside the piece, at least 5 mm from edges and other holes.',
+  h:'Plan four hole positions first, then drill each one with the Drill tool.',
+  b:'Choose Deburr and tap each piece to remove sharp edges and burrs.',
+  g:'Choose Bend, set the angle, drag a bend line across the sheet, then press Confirm bend. Switch to 3D view to inspect the flange!',
+  j:'Move parts so they touch, choose Join, then tap one piece and then the other.',
+  c2:'Make a first cut, then select a piece and cut again along a second scribed line.'
+};
+const mm=(lab,t,t2)=>['Piece measures '+lab+' (±1 mm)',()=>S.p.some(p=>{const d=dims(p);return Math.abs(Math.max(...d)-t)<=1&&Math.abs(Math.min(...d)-t2)<=1}),'File end edges to reduce Length and long edges to reduce Breadth.'];
+
+const PR=[
+  {t:'1. Metal flat bar fitting',tg:[80,20],d:'Make a flat bar fitting 80 × 20 mm from the 100 mm flat bar.',m:'Flat bar',tl:'Steel rule, scriber, cut, file, deburr',mk:'Cutting beyond the marked line; filing only one side.',ck:['m','k','c','f','s','b',mm('80 × 20 mm',80,20)]},
+  {t:'2. Notch fitting',d:'Mark and cut a notch. Build the notch from straight through-cuts and join the parts.',m:'Plate',tl:'Rule, scriber, punch, cut, file, join',mk:'Removing the wrong portion; leaving burrs in corners.',ck:['m','k','u','c2','f','j']},
+  {t:'3. Joint fitting',d:'Make two matching components that fit together.',m:'Plate or flat bar',tl:'Rule, scriber, cut, file, join',mk:'Pieces that differ in size by more than 1 mm.',ck:['m','k','c','f','s','j',['Two pieces match in size (±1 mm)',()=>S.p.some((a,i)=>S.p.some((b,j)=>i<j&&Math.abs(Math.max(...dims(a))-Math.max(...dims(b)))<1&&Math.abs(Math.min(...dims(a))-Math.min(...dims(b)))<1)),'Compare the Length × Breadth readouts of both pieces and file until they match within 1 mm.']]},
+  {t:'4. Sheet metal bracket',d:'Make an L-bracket from sheet metal: scribe, cut, drill mounting holes, deburr, and bend at 90°.',m:'Sheet metal',tl:'Rule, scriber, punch, cut, drill, deburr, bend',mk:'Holes too close to bend line; forgetting to deburr.',ck:['m','k','u','c','d','b','g']},
+  {t:'5. Step fitting',d:'Chalk the surface, scribe lines 24 mm from two adjacent edges, dot punch, clamp in vice, cut, rough & smooth file, and fit.',m:'Plate',tl:'Rule, scriber, punch, vice, cut, files',mk:'Cutting on the line instead of beside it.',ck:['m','k','u','v','c','f','s','j']},
+  {t:'6. Scissor lift mechanism',d:'Assemble a working scissor lift from four matched pivot links, a base, a moving top platform, slider blocks, pivot pins and a spring guide. The pre-cut kit supplies these mechanism-specific parts; students inspect, position and assemble them.',m:'Pre-cut scissor arms, base frame, top platform, slider blocks, pivot pins, spring guide',tl:'All tools',mk:'Misaligned pivot holes; fixed slider ends; links assembled in the wrong order.',ck:['m','k','u','b','h','j']},
+  {t:'7. DC motor pulley mechanism',d:'Manufacture the base plate, side plate, and bent L-angle mount.',m:'Plate, sheet metal',tl:'All tools',mk:'Mounting holes out of position.',ck:['m','k','u','c2','f','b','h','g','j']}
+];
+
+
+const TARGET_SVG=[
+`<svg viewBox="0 0 360 150" role="img" aria-label="Finished flat bar fitting"><rect x="35" y="48" width="290" height="54" rx="4" fill="#8795a3" stroke="#e4edf5" stroke-width="2"/><path d="M35 75H325" stroke="#28323c" stroke-width="2" stroke-dasharray="6 4"/><path d="M35 38V112M325 38V112" stroke="#f2b233" stroke-width="2"/><text x="180" y="132" fill="#e8edf1" font-size="12" text-anchor="middle">80 × 20 mm finished fitting</text></svg>`,
+`<svg viewBox="0 0 360 150" role="img" aria-label="Finished notched fitting"><path d="M55 28H305V62H205V118H55Z" fill="#8795a3" stroke="#e4edf5" stroke-width="2"/><path d="M55 75H205" stroke="#f2b233" stroke-dasharray="5 4"/><text x="180" y="140" fill="#e8edf1" font-size="12" text-anchor="middle">Square notch with clean filed edges</text></svg>`,
+`<svg viewBox="0 0 360 150" role="img" aria-label="Finished fitted joint"><path d="M45 38H195V70H80V118H45Z" fill="#8795a3" stroke="#e4edf5" stroke-width="2"/><path d="M195 38H315V118H280V70H195Z" fill="#a7b4c0" stroke="#e4edf5" stroke-width="2"/><path d="M80 70H280" stroke="#f2b233" stroke-width="2"/><text x="180" y="140" fill="#e8edf1" font-size="12" text-anchor="middle">Two accurately fitted mating pieces</text></svg>`,
+`<svg viewBox="0 0 360 150" role="img" aria-label="Finished L bracket"><path d="M85 28H125V105H285V135H85Z" fill="#aab7c3" stroke="#e4edf5" stroke-width="2"/><path d="M105 48V83M145 120H265" stroke="#f2b233" stroke-width="2" stroke-dasharray="4 3"/><circle cx="105" cy="48" r="6" fill="#26313b" stroke="#e4edf5"/><circle cx="105" cy="75" r="6" fill="#26313b" stroke="#e4edf5"/><circle cx="175" cy="120" r="6" fill="#26313b" stroke="#e4edf5"/><circle cx="245" cy="120" r="6" fill="#26313b" stroke="#e4edf5"/><text x="180" y="16" fill="#e8edf1" font-size="11" text-anchor="middle">90° sheet-metal bracket</text></svg>`,
+`<svg viewBox="0 0 360 150" role="img" aria-label="Finished step fitting"><path d="M55 35H305V65H215V95H135V125H55Z" fill="#8795a3" stroke="#e4edf5" stroke-width="2"/><path d="M55 65H215M55 95H135" stroke="#f2b233" stroke-width="2" stroke-dasharray="5 4"/><text x="180" y="145" fill="#e8edf1" font-size="12" text-anchor="middle">Stepped profile with fitted shoulders</text></svg>`,
+`<svg viewBox="0 0 360 170" role="img" aria-label="Finished spring-assisted scissor lift"><path d="M65 145H295" stroke="#e8edf1" stroke-width="7" stroke-linecap="round"/><path d="M92 35H268" stroke="#e8edf1" stroke-width="9" stroke-linecap="round"><animate attributeName="d" values="M92 35H268;M125 12H235;M92 35H268" dur="3s" repeatCount="indefinite"/></path><path d="M110 140L250 40" stroke="#9eabb8" stroke-width="12" stroke-linecap="round"><animate attributeName="d" values="M110 140L250 40;M135 140L225 17;M110 140L250 40" dur="3s" repeatCount="indefinite"/></path><path d="M250 140L110 40" stroke="#9eabb8" stroke-width="12" stroke-linecap="round"><animate attributeName="d" values="M250 140L110 40;M225 140L135 17;M250 140L110 40" dur="3s" repeatCount="indefinite"/></path><circle cx="180" cy="90" r="8" fill="#f2b233" stroke="#fff" stroke-width="2"/><circle cx="110" cy="140" r="6" fill="#f2b233"/><circle cx="250" cy="140" r="6" fill="#f2b233"/><circle cx="110" cy="40" r="6" fill="#f2b233"/><circle cx="250" cy="40" r="6" fill="#f2b233"/><path d="M180 137v-20l-7-6 14-8-14-8 14-8-7-6V62" fill="none" stroke="#7fd77f" stroke-width="3"/><path d="M180 57V38M173 45l7-7 7 7" stroke="#7fd77f" stroke-width="2" fill="none"/><text x="180" y="164" fill="#e8edf1" font-size="11" text-anchor="middle">Animated up/down reference · spring-assisted lift</text></svg>`,
+`<svg viewBox="0 0 360 160" role="img" aria-label="Finished DC motor pulley mechanism"><rect x="35" y="115" width="290" height="12" rx="3" fill="#8795a3"/><rect x="78" y="63" width="24" height="52" fill="#aab7c3" stroke="#e4edf1"/><rect x="258" y="45" width="24" height="70" fill="#aab7c3" stroke="#e4edf1"/><circle cx="90" cy="52" r="17" fill="#f2b233" stroke="#e8edf1" stroke-width="2"/><circle cx="270" cy="34" r="23" fill="#f2b233" stroke="#e8edf1" stroke-width="2"/><path d="M90 35L270 11M90 69L270 57" stroke="#d8e0e8" stroke-width="4"/><rect x="65" y="82" width="50" height="30" rx="4" fill="#53616f" stroke="#e8edf1"/><text x="180" y="150" fill="#e8edf1" font-size="11" text-anchor="middle">Motor · belt · pulley · mounting frame</text></svg>`
+];
+const items=()=>PR[S.proj].ck.map(c=>typeof c=='string'?[...CK[c],HOW[c]]:c);
+
+
+function side(){
+  const P=PR[S.proj],it=items(),ok=it.filter(x=>x[1]()).length;
+  let h='<h3>Materials (Tap to place)</h3>'+Object.keys(MAT).map(k=>`<button class="mat" data-m="${k}"><span class="sw" style="background:${MAT[k].c}"></span>${MAT[k].n}</button>`).join('');
+  h+='<h3>Project</h3><select id="selP" style="width:100%">'+PR.map((p,i)=>`<option value="${i}"${i==S.proj?' selected':''}>${p.t}</option>`).join('')+'</select>';
+  h+=`<h3>Target output</h3><div style="background:#171c21;border:1px solid #46515d;border-radius:7px;padding:6px;margin:4px 0 8px">${TARGET_SVG[S.proj]}<small style="display:block;color:#cbd5df">Reference preview — manufacture/assemble your own result.</small></div><p>${P.d}</p><p><b>Materials:</b> ${P.m}<br><b>Tools:</b> ${P.tl}<br><b>Common mistakes:</b> ${P.mk}</p>`;
+  if(S.proj===5)h+=`<h3>Mechanism parts kit</h3><p>Factory-prepared links and support parts for the lift assembly.</p><button id="bScissorKit" class="on" style="width:100%">Place pre-cut scissor lift kit</button>`;
+  h+=`<h3>Procedure (${ok}/${it.length} done)</h3><div class="pg"><i style="width:${ok/it.length*100}%"></i></div><ul style="list-style:none;padding:0">`+it.map((x,i)=>`<li class="${x[1]()?'ok':''}">${x[1]()?'✔':i+1+'.'} <b>${x[0]}</b><br><small>${x[2]||''}</small></li>`).join('')+'</ul>';
+  h+='<h3>Workshop Log</h3><p>'+Object.entries(S.st).map(e=>e[0]+': '+e[1]).join(', ')+'</p>';
+  $('side').innerHTML=h;
+  document.querySelectorAll('.mat').forEach(b=>b.onclick=()=>{addPiece(b.dataset.m);$('side').classList.remove('open')});
+  $('selP').onchange=e=>{S.proj=+e.target.value;ui();if(refMode)refCard()};
+  const kit=$('bScissorKit');if(kit)kit.onclick=addScissorKit;
+}
+
+function refCard(){
+  const P=PR[S.proj];
+  $('show').innerHTML=`<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b>Target End Result — ${P.t}</b><span style="color:#f2b233">Reference only</span></div><div style="max-width:520px;margin:8px auto;background:#171c21;border:1px solid #46515d;border-radius:8px;padding:8px">${TARGET_SVG[S.proj]}</div><b>What students are making</b><br>${P.d}<br><b>Material:</b> ${P.m}<br><b>Tools:</b> ${P.tl}<br><small>The preview shows the expected finished shape. Students must complete the workshop operations themselves; the reference does not complete the exercise.</small>`;
+}
+
+function ui(){
+  $('tools').innerHTML=TOOLS.map(t=>`<button class="${tool==t[0]?'on':''}" onclick="tool='${t[0]}';cutLine=null;cutRect=null;shapeCutPts=[];shapeCutPid=null;tmp=null;ui()">${t[1]}</button>`).join('');
+  const p=cur();
+  let a='';
+  if(p){
+    a+=`<button onclick="snap();cur().cl=!cur().cl;if(cur().cl)S.st.clamp++;ui()">${p.cl?'Release vice':'Clamp in vice'}</button>`;
+    a+=`<button onclick="snap();cur().a=(cur().a+15)%360;draw()">Rotate +15°</button>`;
+    a+=`<button onclick="snap();S.p=S.p.filter(x=>x!==cur());sel=null;ui()">Delete piece</button>`;
+  }
+  if(tool==='file'){
+    a+=`<button class="${rough?'on':''}" onclick="rough=true;ui()">Rough (1 mm)</button>`;
+    a+=`<button class="${!rough?'on':''}" onclick="rough=false;ui()">Smooth (0.25 mm)</button>`;
+  }
+  if(tool==='cut'&&cutLine){
+    a+=`<button class="on" onclick="doCut()">Confirm line cut</button><button onclick="cutLine=null;ui()">Cancel</button>`;
+  }
+  if(tool==='shapeCut'){
+    a+=`<button onclick="if(shapeCutPts.length){shapeCutPts.pop();if(!shapeCutPts.length)shapeCutPid=null;ui()}">Undo point</button><button onclick="shapeCutPts=[];shapeCutPid=null;ui()">Clear outline</button>`;
+    if(shapeCutPts.length){const xs=shapeCutPts.map(q=>q[0]),ys=shapeCutPts.map(q=>q[1]);a+=`<span style="font-size:12px;padding:6px">Outline bounds: ${(Math.max(...xs)-Math.min(...xs)).toFixed(1)} × ${(Math.max(...ys)-Math.min(...ys)).toFixed(1)} mm</span>`;}
+    if(shapeCutPts.length>=3)a+=`<button class="on" onclick="doShapeCut()">Confirm shape cut (${shapeCutPts.length} points)</button>`;
+  }
+  if(tool==='bend'){
+    a+=`<select onchange="bendAng=+this.value"><option value="90"${bendAng==90?' selected':''}>90° Bend</option><option value="45"${bendAng==45?' selected':''}>45° Bend</option><option value="135"${bendAng==135?' selected':''}>135° Bend</option></select>`;
+    if(cutLine)a+=`<button class="on" onclick="doBend()">Confirm bend</button><button onclick="cutLine=null;ui()">Cancel</button>`;
+    if(p&&((p.bends&&p.bends.length)||p.bend)){a+=`<button onclick="snap();if(!cur().bends)cur().bends=cur().bend?[cur().bend]:[];cur().bends.pop();cur().bend=null;toast('Last bend removed');ui()">Undo last bend</button><button onclick="snap();cur().bends=[];cur().bend=null;toast('All bends removed');ui()">Unbend all</button>`;}
+  }
+  $('acts').innerHTML=a||`<span style="font-size:12px;opacity:.8">${HINT[tool]}</span>`;
+
+  // Info HUD
+  let inf=`<b>Tool:</b> ${TOOLS.find(t=>t[0]==tool)[1]} — ${HINT[tool]}`;
+  if(p){
+    const d=dims(p);
+    inf+=`<br><b>Selected:</b> ${MAT[p.m].n} | Size: <b>${d[0].toFixed(1)} × ${d[1].toFixed(1)} mm</b> | Thick: ${TH(p)} mm`;
+    if(p.cl)inf+=` | <span style="color:#f2b233">CLAMPED</span>`;
+    if(p.bend&&!p.bends)p.bends=[p.bend];if(p.bends&&p.bends.length)inf+=` | <span style="color:#7fd77f">${p.bends.length} BEND(S)</span>`;
+    if(p.fin===2)inf+=` | Deburred`;
+  }
+  if(note)inf+=`<br><span style="color:#f2b233">${note}</span>`;
+  $('info').innerHTML=inf;
+
+  $('b3d').classList.toggle('on',v3);
+  $('bShow').classList.toggle('on',showMode);
+  $('bRef').classList.toggle('on',refMode);
+  side();
+  draw();
+}
+
+function draw(){
+  const W=cv.width=cv.clientWidth,H=cv.height=cv.clientHeight;
+  cx.clearRect(0,0,W,H);
+
+  // Grid
+  cx.strokeStyle='#ffffff0c';cx.lineWidth=1;
+  if(!v3){
+    const step=10*V.s;
+    if(step>4){
+      for(let x=V.x%step;x<W;x+=step){cx.beginPath();cx.moveTo(x,0);cx.lineTo(x,H);cx.stroke()}
+      for(let y=V.y%step;y<H;y+=step){cx.beginPath();cx.moveTo(0,y);cx.lineTo(W,y);cx.stroke()}
+    }
+  }
+
+  // Draw pieces
+  S.p.forEach(p=>{
+    const isSel=p.id===sel,col=MAT[p.m].c,th=TH(p);
+    if(!v3){
+      cx.save();
+      cx.translate(V.x+p.x*V.s,V.y+p.y*V.s);
+      cx.rotate(rad(p.a));
+      cx.scale(V.s,V.s);
+
+      // Base body
+      cx.beginPath();
+      p.poly.forEach((q,i)=>i?cx.lineTo(q[0],q[1]):cx.moveTo(q[0],q[1]));
+      cx.closePath();
+      cx.fillStyle=col;cx.fill();
+      cx.lineWidth=(isSel?2.2:1.2)/V.s;
+      cx.strokeStyle=isSel?'#f2b233':(p.fin===2?'#7fd77f':'#111');
+      cx.stroke();
+
+      // Show every independent bend crease and its flange region
+      (p.bends||(p.bend?[p.bend]:[])).forEach(bd=>{
+        const flange=clip(p.poly,bd.n,bd.d);
+        if(flange.length>=3){cx.beginPath();flange.forEach((q,i)=>i?cx.lineTo(q[0],q[1]):cx.moveTo(q[0],q[1]));cx.closePath();cx.fillStyle='rgba(0,0,0,0.20)';cx.fill();}
+        cx.beginPath();cx.moveTo(bd.a[0],bd.a[1]);cx.lineTo(bd.b[0],bd.b[1]);
+        cx.strokeStyle='#7fd77f';cx.lineWidth=2/V.s;cx.setLineDash([3/V.s,2/V.s]);cx.stroke();cx.setLineDash([]);
+      });
+
+      // Holes
+      p.holes.forEach(h=>{
+        cx.beginPath();cx.arc(h[0],h[1],h[2],0,Math.PI*2);
+        cx.fillStyle='#1b2025';cx.fill();cx.lineWidth=1/V.s;cx.strokeStyle='#333';cx.stroke();
+      });
+
+      // Marks
+      p.marks.forEach(m=>{
+        if(m.t==='l'){
+          cx.beginPath();cx.moveTo(m.p[0],m.p[1]);cx.lineTo(m.p[2],m.p[3]);
+          cx.strokeStyle='#ff595e';cx.lineWidth=1.2/V.s;cx.stroke();
+        }else{
+          cx.beginPath();cx.arc(m.p[0],m.p[1],1.2,0,Math.PI*2);
+          cx.fillStyle='#ff595e';cx.fill();
+        }
+      });
+
+      // Vice jaws indicator
+      if(p.cl){
+        cx.strokeStyle='#f2b233';cx.lineWidth=3/V.s;
+        cx.strokeRect(-15,-15,30,30);
+      }
+      cx.restore();
+    } else {
+      // 3D rendering: split the sheet into regions at every crease,
+      // then apply the folds in order so all four tray walls can rise.
+      const bends=p.bends||(p.bend?[p.bend]:[]);
+      const projPt=(lx,ly,lz)=>{
+        const fl=foldLocal3D(p,lx,ly,lz);
+        const w=toW(p,fl[0],fl[1]);
+        return pj(w[0],w[1],fl[2]);
+      };
+      let regions=[p.poly];
+      bends.forEach(bd=>{
+        const next=[];
+        regions.forEach(poly=>{
+          const A=clip(poly,bd.n,bd.d),B=clip(poly,[-bd.n[0],-bd.n[1]],-bd.d);
+          if(A.length>=3&&area(A)>0.05)next.push(A);
+          if(B.length>=3&&area(B)>0.05)next.push(B);
+        });
+        regions=next;
+      });
+      regions.forEach(sub=>{
+        const top=sub.map(q=>projPt(q[0],q[1],th));
+        const bot=sub.map(q=>projPt(q[0],q[1],0));
+        cx.fillStyle='#525c66';
+        for(let i=0;i<sub.length;i++){
+          const j=(i+1)%sub.length;
+          cx.beginPath();cx.moveTo(bot[i][0],bot[i][1]);cx.lineTo(bot[j][0],bot[j][1]);cx.lineTo(top[j][0],top[j][1]);cx.lineTo(top[i][0],top[i][1]);cx.closePath();cx.fill();cx.strokeStyle='#222';cx.lineWidth=1;cx.stroke();
+        }
+        cx.beginPath();top.forEach((q,i)=>i?cx.lineTo(q[0],q[1]):cx.moveTo(q[0],q[1]));cx.closePath();
+        cx.fillStyle=col;cx.fill();cx.strokeStyle=isSel?'#f2b233':'#111';cx.lineWidth=isSel?2:1;cx.stroke();
+      });
+      // 3D Holes
+      p.holes.forEach(h=>{
+        const c3=projPt(h[0],h[1],th);
+        cx.beginPath();cx.arc(c3[0],c3[1],h[2]*K.s*0.85,0,Math.PI*2);
+        cx.fillStyle='#1b2025';cx.fill();
+      });
+    }
+  });
+
+  // Joined links indicator
+  S.l.forEach(l=>{
+    const A=S.p.find(p=>p.id==l[0]),B=S.p.find(p=>p.id==l[1]);
+    if(!A||!B)return;
+    const p1=v3?pj(A.x,A.y,TH(A)):[V.x+A.x*V.s,V.y+A.y*V.s];
+    const p2=v3?pj(B.x,B.y,TH(B)):[V.x+B.x*V.s,V.y+B.y*V.s];
+    cx.beginPath();cx.moveTo(p1[0],p1[1]);cx.lineTo(p2[0],p2[1]);
+    cx.strokeStyle='#7fd77f88';cx.lineWidth=2;cx.setLineDash([4,4]);cx.stroke();cx.setLineDash([]);
+  });
+
+  // Shape-cut outline preview (2D only)
+  if(tool==='shapeCut'&&shapeCutPts.length){
+    const p=S.p.find(q=>q.id===shapeCutPid);
+    if(p){const pts=shapeCutPts.map(q=>{const w=toW(p,q[0],q[1]);return [V.x+w[0]*V.s,V.y+w[1]*V.s]});
+      cx.beginPath();pts.forEach((q,i)=>i?cx.lineTo(q[0],q[1]):cx.moveTo(q[0],q[1]));
+      if(pts.length>=3)cx.closePath();cx.strokeStyle='#ff595e';cx.lineWidth=2.5;cx.setLineDash([6,4]);cx.stroke();cx.setLineDash([]);
+      if(pts.length>=3){cx.fillStyle='#ff595e22';cx.fill();}
+      pts.forEach((q,i)=>{cx.beginPath();cx.arc(q[0],q[1],4,0,Math.PI*2);cx.fillStyle='#ff595e';cx.fill();cx.fillStyle='#fff';cx.font='11px system-ui';cx.fillText(String(i+1),q[0]+6,q[1]-6)});
+    }
+  }
+  // Active rectangular area-cut preview
+  const ar=null;
+  if(ar&&ar.a&&ar.b){
+    const q1=v3?pj(ar.a[0],ar.a[1],ar.z||0):[V.x+ar.a[0]*V.s,V.y+ar.a[1]*V.s];
+    const q2=v3?pj(ar.b[0],ar.a[1],ar.z||0):[V.x+ar.b[0]*V.s,V.y+ar.a[1]*V.s];
+    const q3=v3?pj(ar.b[0],ar.b[1],ar.z||0):[V.x+ar.b[0]*V.s,V.y+ar.b[1]*V.s];
+    const q4=v3?pj(ar.a[0],ar.b[1],ar.z||0):[V.x+ar.a[0]*V.s,V.y+ar.b[1]*V.s];
+    cx.beginPath();[q1,q2,q3,q4].forEach((q,i)=>i?cx.lineTo(q[0],q[1]):cx.moveTo(q[0],q[1]));cx.closePath();
+    cx.fillStyle='#f2b23333';cx.strokeStyle='#f2b233';cx.lineWidth=2;cx.setLineDash([6,4]);cx.fill();cx.stroke();cx.setLineDash([]);
+    cx.fillStyle='#f2b233';cx.font='12px system-ui';cx.fillText(`${Math.abs(ar.b[0]-ar.a[0]).toFixed(1)} × ${Math.abs(ar.b[1]-ar.a[1]).toFixed(1)} mm`,Math.min(q1[0],q3[0])+5,Math.min(q1[1],q3[1])+16);
+  }
+  // Active drag / bend / rule line
+  const ln=tmp?tmp:(cutLine?{a:cutLine[0],b:cutLine[1],z:cutLine.z}:null);
+  if(ln&&ln.a&&ln.b){
+    const p1=v3?pj(ln.a[0],ln.a[1],ln.z||0):[V.x+ln.a[0]*V.s,V.y+ln.a[1]*V.s];
+    const p2=v3?pj(ln.b[0],ln.b[1],ln.z||0):[V.x+ln.b[0]*V.s,V.y+ln.b[1]*V.s];
+    cx.beginPath();cx.moveTo(p1[0],p1[1]);cx.lineTo(p2[0],p2[1]);
+    cx.strokeStyle=tool==='bend'?'#7fd77f':'#f2b233';cx.lineWidth=2.5;cx.setLineDash([6,4]);cx.stroke();cx.setLineDash([]);
+    const dist=Math.hypot(ln.b[0]-ln.a[0],ln.b[1]-ln.a[1]).toFixed(1)+' mm';
+    cx.fillStyle='#000c';cx.fillRect((p1[0]+p2[0])/2-28,(p1[1]+p2[1])/2-22,56,18);
+    cx.fillStyle='#f2b233';cx.font='12px system-ui';cx.textAlign='center';
+    cx.fillText(dist,(p1[0]+p2[0])/2,(p1[1]+p2[1])/2-9);
+  }
+
+  // Sparks animation
+  if(sparks.length){
+    sparks.forEach(s=>{
+      s.x+=s.vx*0.03;s.y+=s.vy*0.03;s.life-=0.06;
+      const sp=v3?pj(s.x,s.y,4):[V.x+s.x*V.s,V.y+s.y*V.s];
+      cx.fillStyle=s.c;cx.globalAlpha=Math.max(0,s.life);
+      cx.fillRect(sp[0],sp[1],3,3);
+    });
+    cx.globalAlpha=1;
+    sparks=sparks.filter(s=>s.life>0);
+    requestAnimationFrame(draw);
+  }
+}
+
+// Top Bar Buttons
+$('bPanel').onclick=()=>$('side').classList.toggle('open');
+$('bUndo').onclick=undo;
+$('bRedo').onclick=redoF;
+$('bZi').onclick=()=>zoomAt(cv.clientWidth/2,cv.clientHeight/2,1.25);
+$('bZo').onclick=()=>zoomAt(cv.clientWidth/2,cv.clientHeight/2,0.8);
+$('bFit').onclick=()=>{V={x:40,y:120,s:3};K={cx:0,cy:0,s:3,yaw:0.6,pitch:0.85};draw()};
+$('b3d').onclick=()=>{v3=!v3;toast(v3?'3D View: Drag empty space to orbit':'2D Top View');ui()};
+$('bShow').onclick=()=>{showMode=!showMode;if(showMode){v3=true;toast('Inspect Mode: Drag to orbit piece in 3D')}ui()};
+$('bRef').onclick=()=>{refMode=!refMode;$('show').style.display=refMode?'block':'none';if(refMode)refCard();ui()};
+$('bSave').onclick=()=>{localStorage.setItem('ws_save',JSON.stringify(S));toast('Bench saved')};
+$('bLoad').onclick=()=>{const d=localStorage.getItem('ws_save');if(d){S=JSON.parse(d);S.p.forEach(p=>{if(!p.bends)p.bends=p.bend?[p.bend]:[]});sel=null;ui();toast('Bench loaded')}else toast('No saved bench found')};
+$('bReset').onclick=()=>{snap();S.p=[];S.l=[];sel=null;cutLine=null;cutRect=null;shapeCutPts=[];shapeCutPid=null;ui();toast('Bench cleared')};
+
+window.onresize=draw;
+addPiece('sheet'); // Start with a sheet metal piece ready to test bending!
+$('side').classList.add('open');
+</script>
+</body></html>
